@@ -214,61 +214,141 @@ def lambda_handler(event, context):
       runtime: lambda.Runtime.PYTHON_3_13,
       handler: 'lambda_function.lambda_handler',
       code: lambda.Code.fromInline(`
+import logging
 import json
 import boto3
-from boto3.dynamodb.conditions import Key
+from typing import Dict, Any, List
+from http import HTTPStatus
+from botocore.exceptions import ClientError
 
-def lambda_handler(event, context):
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# DynamoDBクライアントの初期化
+dynamodb = boto3.resource('dynamodb')
+table = dynamodb.Table('students-evaluation')
+
+def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
-    Bedrock Agentのアクショングループから呼び出されるLambda関数
-    DynamoDBから生徒の評価データを取得する
+    AWS Lambda handler for processing Bedrock agent requests.
+    
+    Args:
+        event (Dict[str, Any]): The Lambda event containing action details
+        context (Any): The Lambda context object
+    
+    Returns:
+        Dict[str, Any]: Response containing the action execution results
+    
+    Raises:
+        KeyError: If required fields are missing from the event
     """
     try:
-        # イベントからパラメータを取得
-        students_id = event.get('students_id')
-        period = event.get('period')
+        action_group = event['actionGroup']
+        function = event['function']
+        message_version = event.get('messageVersion', 1)
+        parameters = event.get('parameters', [])
+
+        # 関数に基づいて適切な処理を実行
+        response_body = {}
         
-        if not students_id or not period:
-            return {
-                'statusCode': 400,
-                'message': 'students_id and period are required',
-                'data': None
+        if function == 'get-data-from-dynamodb':
+            # パラメータから学生IDと期間を取得
+            students_id = next((param['value'] for param in parameters if param['name'] == 'students_id'), None)
+            period = next((param['value'] for param in parameters if param['name'] == 'period'), None)
+            
+            if not students_id or not period:
+                response_body = {
+                    'TEXT': {
+                        'body': '学生IDと期間の両方が必要です。'
+                    }
+                }
+            else:
+                # DynamoDBからデータを取得
+                evaluation_data = get_student_evaluation(students_id, period)
+                response_body = {
+                    'TEXT': {
+                        'body': json.dumps(evaluation_data, ensure_ascii=False)
+                    }
+                }
+        else:
+            response_body = {
+                'TEXT': {
+                    'body': f'関数 {function} は実装されていません。'
+                }
             }
+
+        action_response = {
+            'actionGroup': action_group,
+            'function': function,
+            'functionResponse': {
+                'responseBody': response_body
+            }
+        }
         
-        # DynamoDBからデータを取得
-        dynamodb = boto3.resource('dynamodb')
-        table = dynamodb.Table('students-evaluation-by-q')
+        response = {
+            'response': action_response,
+            'messageVersion': message_version
+        }
+
+        logger.info('Response: %s', response)
+        return response
+
+    except KeyError as e:
+        logger.error('Missing required field: %s', str(e))
+        return {
+            'statusCode': HTTPStatus.BAD_REQUEST,
+            'body': f'Error: {str(e)}'
+        }
+    except Exception as e:
+        logger.error('Unexpected error: %s', str(e))
+        return {
+            'statusCode': HTTPStatus.INTERNAL_SERVER_ERROR,
+            'body': 'Internal server error'
+        }
+
+def get_student_evaluation(students_id: str, period: str) -> Dict[str, Any]:
+    """
+    DynamoDBから特定の学生IDと期間に関連するデータを取得します。
+    
+    Args:
+        students_id (str): 学生ID（出席番号や社員番号）
+        period (str): 検索対象期間（年月など）
+    
+    Returns:
+        Dict[str, Any]: 取得した評価データ
+    
+    Raises:
+        ClientError: DynamoDBへのクエリ実行中にエラーが発生した場合
+    """
+    try:
+        logger.info(f"学生ID: {students_id}, 期間: {period} のデータを検索中")
         
-        response = table.get_item(
-            Key={
-                'students_id': students_id,
-                'period': period
+        # DynamoDBのクエリパラメータを設定
+        response = table.query(
+            KeyConditionExpression='students_id = :sid AND period = :p',
+            ExpressionAttributeValues={
+                ':sid': students_id,
+                ':p': period
             }
         )
         
-        item = response.get('Item')
+        items = response.get('Items', [])
+        logger.info(f"検索結果: {len(items)}件のデータが見つかりました")
         
-        if not item:
-            return {
-                'statusCode': 404,
-                'message': f'No data found for student {students_id} in period {period}',
-                'data': None
-            }
+        if not items:
+            return {"message": "指定された学生IDと期間のデータは見つかりませんでした。"}
         
         return {
-            'statusCode': 200,
-            'message': 'Data retrieved successfully',
-            'data': item
+            "students_id": students_id,
+            "period": period,
+            "data": items
         }
         
-    except Exception as e:
-        print(f"Error: {str(e)}")
-        return {
-            'statusCode': 500,
-            'message': f'Internal server error: {str(e)}',
-            'data': None
-        }
-      `),
+    except ClientError as e:
+        logger.error(f"DynamoDBクエリエラー: {e.response['Error']['Message']}")
+        raise
+
+`),
       timeout: cdk.Duration.seconds(30),
       memorySize: 128,
       role: getDynamoDbRole,
@@ -280,7 +360,7 @@ def lambda_handler(event, context):
       agentResourceRoleArn: bedrockAgentRole.roleArn,
       description: '生徒の成績を評価するAIエージェント',
       foundationModel: 'anthropic.claude-3-5-sonnet-20240620-v1:0',
-      instruction: '生徒たちの成績を評価する教師エージェントです。定められた評価基準にしたがって、生徒たちの成績をつけていきます。',
+      instruction: 'あなたは生徒たちの成績を評価する教師エージェントです。定められた評価基準にしたがって、生徒たちの成績をつけていきます。\n\n1. データを取得する\n- ユーザーからタスクを依頼された時、まずはアクショングループ「get-students-data」のLambda関数を用いて、DynamoDBからデータを取得します。\n- 取得したデータは、以下の評価基準にしたがって、成績を評価する際に使用します。\n\n2. 以下の評価基準にしたがって、成績を評価する。その際、根拠も同時に作成してください。\n-  知識・理解\n  - 国語: 読解力、作文能力、漢字の理解と使用、語彙力\n  - 算数: 計算スキル、図形理解、問題解決能力、数学的思考\n  - 理科: 科学的概念の理解、観察力、実験への取り組み\n  - 社会: 地理・歴史の基礎知識、社会の仕組みの理解\n  - 英語: 基本的な単語理解、簡単な会話表現\n- 思考力・判断力・表現力\n  - 問題に対する論理的思考能力\n  - 自分の考えを適切に表現する能力\n  - 創造的な解決策を考える力\n  - グループ活動での意見交換能力\n- 主体性\n  - 授業への積極的な参加度\n  - 宿題の完成度と提出状況\n  - 自主学習への取り組み\n  - 学習の継続性と集中力\n\n3. 作成した評価をユーザーへ返してください。',
       idleSessionTtlInSeconds: 600,
       // アクショングループを定義
       actionGroups: [
@@ -343,75 +423,123 @@ def lambda_handler(event, context):
       handler: 'lambda_function.lambda_handler',
       code: lambda.Code.fromInline(`
 import json
-import os
 import boto3
+import uuid
+from datetime import datetime
+import os
 import time
 
+# クライアントの初期化
+bedrock_client = boto3.client('bedrock-agent-runtime', region_name='us-east-1')
+dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
+table = dynamodb.Table('students-evaluation')
+# SNSクライアントを初期化
+sns = boto3.client('sns', region_name='us-east-1')
+
 def lambda_handler(event, context):
-    """
-    EventBridge Schedulerから定期的に呼び出されるLambda関数
-    Bedrock Agentを呼び出して生徒の評価を行う
-    """
     try:
-        # 環境変数から設定を取得
-        agent_id = os.environ['AGENT_ID']
-        agent_alias_id = os.environ['AGENT_ALIAS_ID']
-        sns_topic_arn = os.environ['SNS_TOPIC_ARN']
-        
-        # イベントからパラメータを取得
-        students_id = event.get('students_id')
-        period = event.get('period')
-        
-        if not students_id or not period:
-            raise ValueError("students_id and period are required")
-        
-        # Bedrock Agentを呼び出す
-        bedrock_agent_runtime = boto3.client('bedrock-agent-runtime')
-        
-        # エージェントに送信するプロンプト
-        prompt = f"生徒ID {students_id} の {period} 期間の評価を行ってください。"
-        
-        # エージェントを呼び出す
-        response = bedrock_agent_runtime.invoke_agent(
-            agentId=agent_id,
-            agentAliasId=agent_alias_id,
-            sessionId=f"{students_id}-{period}-{int(time.time())}",
-            inputText=prompt
-        )
-        
-        # レスポンスを処理
-        completion = ""
-        for event in response.get('completion'):
-            chunk = event.get('chunk')
-            if chunk and 'bytes' in chunk:
-                completion += chunk['bytes'].decode('utf-8')
-        
-        # 評価結果をSNSで通知
-        sns = boto3.client('sns')
-        sns.publish(
-            TopicArn=sns_topic_arn,
-            Subject=f"生徒 {students_id} の評価が完了しました",
-            Message=f"期間: {period}\\n\\n評価結果:\\n{completion}"
-        )
-        
+        print(f"受信したイベント: {json.dumps(event)}")
+
+        # EventBridgeから渡されたペイロードを取得
+        students_id = event.get('students_id', '1')
+        period = event.get('period', '202504')
+        # ループ回数を指定（例: 3回）
+        loop_count = int(event.get('loop_count', 3))
+        # students_idをintに変換
+        current_id = int(students_id)
+        results = []
+        for i in range(loop_count):
+            input_text = (f"出席番号: {str(current_id)} の生徒の評価を行ってください。 期間は {period} です。")
+            # Bedrock Agentの定義
+            agent_id = os.environ['AGENT_ID']
+            agent_alias_id = os.environ['AGENT_ALIAS_ID']
+            session_id = str(uuid.uuid4())
+            
+            # Invoke Agent APIを呼び出す
+            response = bedrock_client.invoke_agent(
+                agentId=agent_id,
+                agentAliasId=agent_alias_id,
+                sessionId=session_id,
+                inputText=input_text,
+                enableTrace=True,
+                streamingConfigurations={
+                    "streamFinalResponse": False
+                }
+            )
+
+            # レスポンスからテキストを抽出
+            # EventStreamを適切に処理
+            agent_response = ""
+            event_stream = response["completion"]
+            
+            # EventStreamをループして応答テキストを収集
+            for event in event_stream:
+                if 'chunk' in event:
+                    chunk = event['chunk']
+                    if 'bytes' in chunk:
+                        # バイナリデータをデコード
+                        text = chunk['bytes'].decode('utf-8')
+                        agent_response += text
+            
+            print(f"Bedrock Agentからのレスポンス: {agent_response}")
+
+            # タイムスタンプを生成（ISO形式）- DynamoDBの属性名として使用するために安全に変換
+            timestamp = datetime.now().isoformat().replace(':', '_').replace('.', '_')
+
+            # DynamoDBに評価結果を追加
+            table.update_item(
+                Key={
+                    'students_id': str(current_id),
+                    'period': period
+                },
+                UpdateExpression='SET agent_evaluation = :eval, evaluation_date = :date',
+                ExpressionAttributeValues={
+                    ':eval': agent_response,
+                    ':date': timestamp
+                }
+            )
+            results.append({
+                'id': str(current_id)
+            })
+            current_id += 1
+            time.sleep(30)
+            
+        # 処理成功の通知をSNSトピックに送信
+        if 'SNS_TOPIC_ARN' in os.environ:
+            sns.publish(
+                TopicArn=os.environ['SNS_TOPIC_ARN'],
+                Subject='生徒評価処理完了通知',
+                Message=f'以下の生徒IDの評価処理が正常に完了しました。\n期間: {period}\n処理したID: {[result["id"] for result in results]}'
+            )
+            
         return {
             'statusCode': 200,
             'body': json.dumps({
-                'message': 'Agent invocation successful',
-                'students_id': students_id,
-                'period': period
+                'message': '処理が完了しました',
+                'results': results
             })
         }
-        
+
     except Exception as e:
-        print(f"Error: {str(e)}")
+        error_message = f"エラーが発生しました: {e}"
+        print(error_message)
+        
+        # エラー通知をSNSトピックに送信
+        if 'SNS_TOPIC_ARN' in os.environ:
+            sns.publish(
+                TopicArn=os.environ['SNS_TOPIC_ARN'],
+                Subject='生徒評価処理エラー通知',
+                Message=f'処理中にエラーが発生しました。\n期間: {period}\n開始ID: {students_id}\nエラー: {str(e)}'
+            )
+            
         return {
             'statusCode': 500,
             'body': json.dumps({
-                'message': f'Error invoking agent: {str(e)}'
+                'message': 'エラーが発生しました',
+                'error': str(e)
             })
         }
-      `),
+`),
       timeout: cdk.Duration.seconds(300),
       memorySize: 1024,
       role: callAgentRole,
