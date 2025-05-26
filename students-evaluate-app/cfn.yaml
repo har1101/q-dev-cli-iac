@@ -1,0 +1,696 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: '学生評価システム - CDKスタックから変換されたCloudFormationテンプレート'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    Description: '環境名（開発/本番）'
+
+Resources:
+  # DynamoDBテーブル
+  StudentsEvaluationTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: students-evaluation-by-q
+      AttributeDefinitions:
+        - AttributeName: students_id
+          AttributeType: S
+        - AttributeName: period
+          AttributeType: S
+      KeySchema:
+        - AttributeName: students_id
+          KeyType: HASH
+        - AttributeName: period
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+    DeletionPolicy: Retain
+
+  # SNSトピック（エージェント完了通知用）
+  FinishAgentMailTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: finish-agent-mail-by-q
+
+  # API Gateway + Lambda用のロール
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt StudentsEvaluationTable.Arn
+
+  # API Gateway統合Lambda関数
+  EvaluationApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'students-evaluation-api-${Environment}-by-q'
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          from datetime import datetime
+
+          def lambda_handler(event, context):
+              """
+              API Gateway経由でDynamoDBのデータを取得・更新するLambda関数
+              """
+              try:
+                  # 環境変数からテーブル名を取得
+                  table_name = os.environ['TABLE_NAME']
+                  dynamodb = boto3.resource('dynamodb')
+                  table = dynamodb.Table(table_name)
+                  
+                  # HTTPメソッドに応じた処理
+                  http_method = event['httpMethod']
+                  
+                  if http_method == 'GET':
+                      # クエリパラメータからstudents_idとperiodを取得
+                      query_params = event.get('queryStringParameters', {}) or {}
+                      students_id = query_params.get('students_id')
+                      period = query_params.get('period')
+                      
+                      if not students_id or not period:
+                          return {
+                              'statusCode': 400,
+                              'body': json.dumps({'message': 'students_id and period are required'})
+                          }
+                      
+                      # DynamoDBからデータを取得
+                      response = table.get_item(
+                          Key={
+                              'students_id': students_id,
+                              'period': period
+                          }
+                      )
+                      
+                      item = response.get('Item', {})
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps(item)
+                      }
+                      
+                  elif http_method == 'PUT':
+                      # リクエストボディからデータを取得
+                      body = json.loads(event['body'])
+                      students_id = body.get('students_id')
+                      period = body.get('period')
+                      achievements = body.get('achievements', [])
+                      
+                      if not students_id or not period or not achievements:
+                          return {
+                              'statusCode': 400,
+                              'body': json.dumps({'message': 'students_id, period, and achievements are required'})
+                          }
+                      
+                      # 現在の日時を取得
+                      current_time = datetime.now().isoformat()
+                      
+                      # DynamoDBにデータを保存
+                      table.put_item(
+                          Item={
+                              'students_id': students_id,
+                              'period': period,
+                              'achievements': achievements,
+                              'updated_at': current_time
+                          }
+                      )
+                      
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({'message': 'Data saved successfully'})
+                      }
+                  
+                  else:
+                      return {
+                          'statusCode': 405,
+                          'body': json.dumps({'message': 'Method not allowed'})
+                      }
+                      
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'message': f'Internal server error: {str(e)}'})
+                  }
+      Timeout: 30
+      MemorySize: 256
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref StudentsEvaluationTable
+
+  # API Gateway
+  EvaluationApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub 'students-evaluation-api-${Environment}-by-q'
+      Description: '学生評価システム用API'
+
+  # API Gatewayリソース
+  EvaluationResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref EvaluationApi
+      ParentId: !GetAtt EvaluationApi.RootResourceId
+      PathPart: evaluation
+
+  # API Gateway GETメソッド
+  EvaluationGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref EvaluationApi
+      ResourceId: !Ref EvaluationResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${EvaluationApiFunction.Arn}/invocations'
+
+  # API Gateway PUTメソッド
+  EvaluationPutMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref EvaluationApi
+      ResourceId: !Ref EvaluationResource
+      HttpMethod: PUT
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${EvaluationApiFunction.Arn}/invocations'
+
+  # Lambda権限（API Gateway用）
+  ApiGatewayLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EvaluationApiFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub '${EvaluationApi}/*/evaluation'
+
+  # API Gatewayデプロイメント
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - EvaluationGetMethod
+      - EvaluationPutMethod
+    Properties:
+      RestApiId: !Ref EvaluationApi
+      StageName: !Ref Environment
+
+  # Bedrock Agent用のロール
+  BedrockAgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AmazonBedrockExecutionRoleForAgents-by-q
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+              ArnLike:
+                'aws:SourceArn': !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:agent/*'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSLambda_FullAccess
+
+  # DynamoDBからデータを取得するLambda関数用のロール
+  GetDynamoDbRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: get-data-from-dynamodb-role-by-q
+      Path: /service-role/
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonDynamoDBReadOnlyAccess
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # DynamoDBからデータを取得するLambda関数
+  GetDataFromDynamoDb:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: get-data-from-dynamodb-by-q
+      Runtime: python3.13
+      Handler: lambda_function.lambda_handler
+      Code:
+        ZipFile: |
+          import logging
+          import json
+          import boto3
+          from typing import Dict, Any, List
+          from http import HTTPStatus
+          from botocore.exceptions import ClientError
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # DynamoDBクライアントの初期化
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table('students-evaluation')
+
+          def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+              """
+              AWS Lambda handler for processing Bedrock agent requests.
+              
+              Args:
+                  event (Dict[str, Any]): The Lambda event containing action details
+                  context (Any): The Lambda context object
+              
+              Returns:
+                  Dict[str, Any]: Response containing the action execution results
+              
+              Raises:
+                  KeyError: If required fields are missing from the event
+              """
+              try:
+                  action_group = event['actionGroup']
+                  function = event['function']
+                  message_version = event.get('messageVersion', 1)
+                  parameters = event.get('parameters', [])
+
+                  # 関数に基づいて適切な処理を実行
+                  response_body = {}
+                  
+                  if function == 'get-data-from-dynamodb':
+                      # パラメータから学生IDと期間を取得
+                      students_id = next((param['value'] for param in parameters if param['name'] == 'students_id'), None)
+                      period = next((param['value'] for param in parameters if param['name'] == 'period'), None)
+                      
+                      if not students_id or not period:
+                          response_body = {
+                              'TEXT': {
+                                  'body': '学生IDと期間の両方が必要です。'
+                              }
+                          }
+                      else:
+                          # DynamoDBからデータを取得
+                          evaluation_data = get_student_evaluation(students_id, period)
+                          response_body = {
+                              'TEXT': {
+                                  'body': json.dumps(evaluation_data, ensure_ascii=False)
+                              }
+                          }
+                  else:
+                      response_body = {
+                          'TEXT': {
+                              'body': f'関数 {function} は実装されていません。'
+                          }
+                      }
+
+                  action_response = {
+                      'actionGroup': action_group,
+                      'function': function,
+                      'functionResponse': {
+                          'responseBody': response_body
+                      }
+                  }
+                  
+                  response = {
+                      'response': action_response,
+                      'messageVersion': message_version
+                  }
+
+                  logger.info('Response: %s', response)
+                  return response
+
+              except KeyError as e:
+                  logger.error('Missing required field: %s', str(e))
+                  return {
+                      'statusCode': HTTPStatus.BAD_REQUEST,
+                      'body': f'Error: {str(e)}'
+                  }
+              except Exception as e:
+                  logger.error('Unexpected error: %s', str(e))
+                  return {
+                      'statusCode': HTTPStatus.INTERNAL_SERVER_ERROR,
+                      'body': 'Internal server error'
+                  }
+
+          def get_student_evaluation(students_id: str, period: str) -> Dict[str, Any]:
+              """
+              DynamoDBから特定の学生IDと期間に関連するデータを取得します。
+              
+              Args:
+                  students_id (str): 学生ID（出席番号や社員番号）
+                  period (str): 検索対象期間（年月など）
+              
+              Returns:
+                  Dict[str, Any]: 取得した評価データ
+              
+              Raises:
+                  ClientError: DynamoDBへのクエリ実行中にエラーが発生した場合
+              """
+              try:
+                  logger.info(f"学生ID: {students_id}, 期間: {period} のデータを検索中")
+                  
+                  # DynamoDBのクエリパラメータを設定
+                  response = table.query(
+                      KeyConditionExpression='students_id = :sid AND period = :p',
+                      ExpressionAttributeValues={
+                          ':sid': students_id,
+                          ':p': period
+                      }
+                  )
+                  
+                  items = response.get('Items', [])
+                  logger.info(f"検索結果: {len(items)}件のデータが見つかりました")
+                  
+                  if not items:
+                      return {"message": "指定された学生IDと期間のデータは見つかりませんでした。"}
+                  
+                  return {
+                      "students_id": students_id,
+                      "period": period,
+                      "data": items
+                  }
+                  
+              except ClientError as e:
+                  logger.error(f"DynamoDBクエリエラー: {e.response['Error']['Message']}")
+                  raise
+      Timeout: 30
+      MemorySize: 128
+      Role: !GetAtt GetDynamoDbRole.Arn
+
+  # Bedrock Agent
+  BedrockAgent:
+    Type: AWS::Bedrock::Agent
+    Properties:
+      AgentName: evaluate-students-agent-by-q
+      AgentResourceRoleArn: !GetAtt BedrockAgentRole.Arn
+      Description: '生徒の成績を評価するAIエージェント'
+      FoundationModel: anthropic.claude-3-5-sonnet-20240620-v1:0
+      Instruction: |
+        あなたは生徒たちの成績を評価する教師エージェントです。定められた評価基準にしたがって、生徒たちの成績をつけていきます。
+
+        1. データを取得する
+        - ユーザーからタスクを依頼された時、まずはアクショングループ「get-students-data」のLambda関数を用いて、DynamoDBからデータを取得します。
+        - 取得したデータは、以下の評価基準にしたがって、成績を評価する際に使用します。
+
+        2. 以下の評価基準にしたがって、成績を評価する。その際、根拠も同時に作成してください。
+        -  知識・理解
+          - 国語: 読解力、作文能力、漢字の理解と使用、語彙力
+          - 算数: 計算スキル、図形理解、問題解決能力、数学的思考
+          - 理科: 科学的概念の理解、観察力、実験への取り組み
+          - 社会: 地理・歴史の基礎知識、社会の仕組みの理解
+          - 英語: 基本的な単語理解、簡単な会話表現
+        - 思考力・判断力・表現力
+          - 問題に対する論理的思考能力
+          - 自分の考えを適切に表現する能力
+          - 創造的な解決策を考える力
+          - グループ活動での意見交換能力
+        - 主体性
+          - 授業への積極的な参加度
+          - 宿題の完成度と提出状況
+          - 自主学習への取り組み
+          - 学習の継続性と集中力
+
+        3. 作成した評価をユーザーへ返してください。
+      IdleSessionTtlInSeconds: 600
+      ActionGroups:
+        - ActionGroupName: get-students-data
+          Description: '評価対象となる生徒の情報をDynamoDBから取得するためのアクショングループです'
+          ActionGroupState: ENABLED
+          ActionGroupExecutor:
+            Lambda: !GetAtt GetDataFromDynamoDb.Arn
+          FunctionSchema:
+            Functions:
+              - Name: get-data-from-dynamodb
+                Description: '評価対象となる生徒の情報をDynamoDBから取得する関数です。'
+                Parameters:
+                  students_id:
+                    Type: string
+                    Description: '出席番号'
+                    Required: true
+                  period:
+                    Type: string
+                    Description: 'データを取得する対象期間'
+                    Required: true
+
+  # Bedrock Agent Alias
+  BedrockAgentAlias:
+    Type: AWS::Bedrock::AgentAlias
+    Properties:
+      AgentId: !GetAtt BedrockAgent.AgentId
+      AgentAliasName: v1
+
+  # エージェント呼び出し用Lambda関数のロール
+  CallAgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: call-agent-function-role-by-q
+      Path: /service-role/
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSNSFullAccess
+        - arn:aws:iam::aws:policy/AmazonBedrockFullAccess
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # エージェント呼び出し用Lambda関数
+  CallAgentFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: call-agent-function-by-q
+      Runtime: python3.13
+      Handler: lambda_function.lambda_handler
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          from datetime import datetime
+          import os
+          import time
+
+          # クライアントの初期化
+          bedrock_client = boto3.client('bedrock-agent-runtime', region_name='us-east-1')
+          dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
+          table = dynamodb.Table('students-evaluation')
+          # SNSクライアントを初期化
+          sns = boto3.client('sns', region_name='us-east-1')
+
+          def lambda_handler(event, context):
+              try:
+                  print(f"受信したイベント: {json.dumps(event)}")
+
+                  # EventBridgeから渡されたペイロードを取得
+                  students_id = event.get('students_id', '1')
+                  period = event.get('period', '202504')
+                  # ループ回数を指定（例: 3回）
+                  loop_count = int(event.get('loop_count', 3))
+                  # students_idをintに変換
+                  current_id = int(students_id)
+                  results = []
+                  for i in range(loop_count):
+                      input_text = (f"出席番号: {str(current_id)} の生徒の評価を行ってください。 期間は {period} です。")
+                      # Bedrock Agentの定義
+                      agent_id = os.environ['AGENT_ID']
+                      agent_alias_id = os.environ['AGENT_ALIAS_ID']
+                      session_id = str(uuid.uuid4())
+                      
+                      # Invoke Agent APIを呼び出す
+                      response = bedrock_client.invoke_agent(
+                          agentId=agent_id,
+                          agentAliasId=agent_alias_id,
+                          sessionId=session_id,
+                          inputText=input_text,
+                          enableTrace=True,
+                          streamingConfigurations={
+                              "streamFinalResponse": False
+                          }
+                      )
+
+                      # レスポンスからテキストを抽出
+                      # EventStreamを適切に処理
+                      agent_response = ""
+                      event_stream = response["completion"]
+                      
+                      # EventStreamをループして応答テキストを収集
+                      for event in event_stream:
+                          if 'chunk' in event:
+                              chunk = event['chunk']
+                              if 'bytes' in chunk:
+                                  # バイナリデータをデコード
+                                  text = chunk['bytes'].decode('utf-8')
+                                  agent_response += text
+                      
+                      print(f"Bedrock Agentからのレスポンス: {agent_response}")
+
+                      # タイムスタンプを生成（ISO形式）- DynamoDBの属性名として使用するために安全に変換
+                      timestamp = datetime.now().isoformat().replace(':', '_').replace('.', '_')
+
+                      # DynamoDBに評価結果を追加
+                      table.update_item(
+                          Key={
+                              'students_id': str(current_id),
+                              'period': period
+                          },
+                          UpdateExpression='SET agent_evaluation = :eval, evaluation_date = :date',
+                          ExpressionAttributeValues={
+                              ':eval': agent_response,
+                              ':date': timestamp
+                          }
+                      )
+                      results.append({
+                          'id': str(current_id)
+                      })
+                      current_id += 1
+                      time.sleep(30)
+                      
+                  # 処理成功の通知をSNSトピックに送信
+                  if 'SNS_TOPIC_ARN' in os.environ:
+                      sns.publish(
+                          TopicArn=os.environ['SNS_TOPIC_ARN'],
+                          Subject='生徒評価処理完了通知',
+                          Message=f'以下の生徒IDの評価処理が正常に完了しました。\n期間: {period}\n処理したID: {[result["id"] for result in results]}'
+                      )
+                      
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': '処理が完了しました',
+                          'results': results
+                      })
+                  }
+
+              except Exception as e:
+                  error_message = f"エラーが発生しました: {e}"
+                  print(error_message)
+                  
+                  # エラー通知をSNSトピックに送信
+                  if 'SNS_TOPIC_ARN' in os.environ:
+                      sns.publish(
+                          TopicArn=os.environ['SNS_TOPIC_ARN'],
+                          Subject='生徒評価処理エラー通知',
+                          Message=f'処理中にエラーが発生しました。\n期間: {period}\n開始ID: {students_id}\nエラー: {str(e)}'
+                      )
+                      
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'message': 'エラーが発生しました',
+                          'error': str(e)
+                      })
+                  }
+      Timeout: 300
+      MemorySize: 1024
+      Role: !GetAtt CallAgentRole.Arn
+      Environment:
+        Variables:
+          AGENT_ID: !GetAtt BedrockAgent.AgentId
+          AGENT_ALIAS_ID: !GetAtt BedrockAgentAlias.AgentAliasId
+          SNS_TOPIC_ARN: !Ref FinishAgentMailTopic
+
+  # EventBridge Scheduler用のロール
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaInvokePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt CallAgentFunction.Arn
+
+  # EventBridge Scheduler
+  CallAgentSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: call-agent-schedule-by-q
+      Description: '生徒評価エージェントを定期的に呼び出すスケジュール'
+      ScheduleExpression: 'cron(50 11 * * ? *)'
+      ScheduleExpressionTimezone: Asia/Tokyo
+      Target:
+        Arn: !GetAtt CallAgentFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: |
+          {
+            "students_id": "30000",
+            "period": "202504"
+          }
+        RetryPolicy:
+          MaximumRetryAttempts: 0
+          MaximumEventAgeInSeconds: 86400
+      State: ENABLED
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+
+  # Lambda権限（Bedrock Agent用）
+  BedrockAgentLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GetDataFromDynamoDb
+      Action: lambda:InvokeFunction
+      Principal: bedrock.amazonaws.com
+      SourceArn: !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:agent/*'
+
+Outputs:
+  DynamoDBTableName:
+    Description: 'DynamoDBテーブル名'
+    Value: !Ref StudentsEvaluationTable
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBTableName'
+
+  ApiEndpoint:
+    Description: 'API Gatewayエンドポイント'
+    Value: !Sub 'https://${EvaluationApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiEndpoint'
+
+  BedrockAgentId:
+    Description: 'Bedrock Agent ID'
+    Value: !GetAtt BedrockAgent.AgentId
+    Export:
+      Name: !Sub '${AWS::StackName}-BedrockAgentId'
+
+  BedrockAgentAliasId:
+    Description: 'Bedrock Agent Alias ID'
+    Value: !GetAtt BedrockAgentAlias.AgentAliasId
+    Export:
+      Name: !Sub '${AWS::StackName}-BedrockAgentAliasId'
