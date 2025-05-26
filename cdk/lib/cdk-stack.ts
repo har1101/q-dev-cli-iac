@@ -10,7 +10,7 @@ import * as scheduler from 'aws-cdk-lib/aws-scheduler';
 import * as scheduler_targets from 'aws-cdk-lib/aws-scheduler-targets';
 import { TimeZone } from 'aws-cdk-lib';
 
-export class CdkStack extends cdk.Stack {
+export class EvaluateStudentsStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 

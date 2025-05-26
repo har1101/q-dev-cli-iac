@@ -1,0 +1,347 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: '学生評価システム用のAPI Gateway + Lambda + DynamoDB構成'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    Description: デプロイ環境（dev, test, prod）
+    AllowedValues:
+      - dev
+      - test
+      - prod
+  
+  LambdaRuntime:
+    Type: String
+    Default: python3.12
+    Description: Lambda関数のランタイム
+
+Resources:
+  # DynamoDBテーブル
+  StudentsEvaluationTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: students-evaluation
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: students_id
+          AttributeType: S
+        - AttributeName: period
+          AttributeType: S
+      KeySchema:
+        - AttributeName: students_id
+          KeyType: HASH
+        - AttributeName: period
+          KeyType: RANGE
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda実行ロール
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt StudentsEvaluationTable.Arn
+
+  # API用Lambda関数
+  EvaluationApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'students-evaluation-api-${Environment}'
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: !Ref LambdaRuntime
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref StudentsEvaluationTable
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from typing import Dict, Any
+          from http import HTTPStatus
+          from botocore.exceptions import ClientError
+
+          # DynamoDBクライアントの初期化
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['TABLE_NAME'])
+
+          def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+              """
+              API Gateway経由のリクエストを処理するLambda関数
+              
+              Args:
+                  event (Dict[str, Any]): API Gatewayからのイベント
+                  context (Any): Lambda実行コンテキスト
+              
+              Returns:
+                  Dict[str, Any]: API Gatewayに返すレスポンス
+              """
+              try:
+                  # HTTPメソッドを取得
+                  http_method = event['httpMethod']
+                  
+                  # パスパラメータとクエリパラメータを取得
+                  path_parameters = event.get('pathParameters', {}) or {}
+                  query_parameters = event.get('queryStringParameters', {}) or {}
+                  
+                  # リクエストボディを取得（PUT/POSTの場合）
+                  body = {}
+                  if 'body' in event and event['body']:
+                      body = json.loads(event['body'])
+                  
+                  # HTTPメソッドに応じた処理
+                  if http_method == 'GET':
+                      # GETリクエスト処理
+                      students_id = query_parameters.get('students_id')
+                      period = query_parameters.get('period')
+                      
+                      if not students_id or not period:
+                          return {
+                              'statusCode': HTTPStatus.BAD_REQUEST,
+                              'headers': {'Content-Type': 'application/json'},
+                              'body': json.dumps({
+                                  'message': '学生IDと期間の両方が必要です。'
+                              })
+                          }
+                      
+                      # DynamoDBからデータを取得
+                      result = get_student_evaluation(students_id, period)
+                      
+                      return {
+                          'statusCode': HTTPStatus.OK,
+                          'headers': {'Content-Type': 'application/json'},
+                          'body': json.dumps(result)
+                      }
+                      
+                  elif http_method == 'PUT':
+                      # PUTリクエスト処理
+                      students_id = body.get('students_id')
+                      period = body.get('period')
+                      teacher_evaluation = body.get('teacher_evaluation')
+                      
+                      if not students_id or not period or not teacher_evaluation:
+                          return {
+                              'statusCode': HTTPStatus.BAD_REQUEST,
+                              'headers': {'Content-Type': 'application/json'},
+                              'body': json.dumps({
+                                  'message': '学生ID、期間、教師評価の全てが必要です。'
+                              })
+                          }
+                      
+                      # DynamoDBにデータを更新
+                      result = update_teacher_evaluation(students_id, period, teacher_evaluation)
+                      
+                      return {
+                          'statusCode': HTTPStatus.OK,
+                          'headers': {'Content-Type': 'application/json'},
+                          'body': json.dumps(result)
+                      }
+                  
+                  else:
+                      # サポートされていないHTTPメソッド
+                      return {
+                          'statusCode': HTTPStatus.METHOD_NOT_ALLOWED,
+                          'headers': {'Content-Type': 'application/json'},
+                          'body': json.dumps({
+                              'message': f'HTTPメソッド {http_method} はサポートされていません。'
+                          })
+                      }
+                      
+              except Exception as e:
+                  # エラー処理
+                  print(f"エラーが発生しました: {str(e)}")
+                  return {
+                      'statusCode': HTTPStatus.INTERNAL_SERVER_ERROR,
+                      'headers': {'Content-Type': 'application/json'},
+                      'body': json.dumps({
+                          'message': 'サーバーエラーが発生しました。',
+                          'error': str(e)
+                      })
+                  }
+
+          def get_student_evaluation(students_id: str, period: str) -> Dict[str, Any]:
+              """
+              DynamoDBから特定の学生IDと期間に関連するデータを取得します。
+              
+              Args:
+                  students_id (str): 学生ID（出席番号）
+                  period (str): 検索対象期間（年月）
+              
+              Returns:
+                  Dict[str, Any]: 取得した評価データ
+              """
+              try:
+                  # DynamoDBのクエリパラメータを設定
+                  response = table.get_item(
+                      Key={
+                          'students_id': students_id,
+                          'period': period
+                      }
+                  )
+                  
+                  # 結果を取得
+                  item = response.get('Item', {})
+                  
+                  if not item:
+                      return {
+                          "message": "指定された学生IDと期間のデータは見つかりませんでした。",
+                          "students_id": students_id,
+                          "period": period
+                      }
+                  
+                  return item
+                  
+              except ClientError as e:
+                  print(f"DynamoDBクエリエラー: {e.response['Error']['Message']}")
+                  raise
+
+          def update_teacher_evaluation(students_id: str, period: str, teacher_evaluation: str) -> Dict[str, Any]:
+              """
+              DynamoDBの特定の学生IDと期間のデータに教師評価を追加・更新します。
+              
+              Args:
+                  students_id (str): 学生ID（出席番号）
+                  period (str): 検索対象期間（年月）
+                  teacher_evaluation (str): 教師による評価内容
+              
+              Returns:
+                  Dict[str, Any]: 更新結果
+              """
+              try:
+                  # DynamoDBの更新パラメータを設定
+                  response = table.update_item(
+                      Key={
+                          'students_id': students_id,
+                          'period': period
+                      },
+                      UpdateExpression='SET teacher_evaluation = :te',
+                      ExpressionAttributeValues={
+                          ':te': teacher_evaluation
+                      },
+                      ReturnValues='ALL_NEW'
+                  )
+                  
+                  # 更新後のアイテムを取得
+                  updated_item = response.get('Attributes', {})
+                  
+                  return {
+                      "message": "教師評価を更新しました。",
+                      "students_id": students_id,
+                      "period": period,
+                      "updated_item": updated_item
+                  }
+                  
+              except ClientError as e:
+                  print(f"DynamoDB更新エラー: {e.response['Error']['Message']}")
+                  raise
+
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # API Gateway
+  EvaluationApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub 'students-evaluation-api-${Environment}'
+      Description: '学生評価システム用API'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # APIリソース
+  EvaluationResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref EvaluationApi
+      ParentId: !GetAtt EvaluationApi.RootResourceId
+      PathPart: 'evaluation'
+
+  # GETメソッド
+  EvaluationGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref EvaluationApi
+      ResourceId: !Ref EvaluationResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${EvaluationApiFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: '200'
+        - StatusCode: '400'
+        - StatusCode: '500'
+
+  # PUTメソッド
+  EvaluationPutMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref EvaluationApi
+      ResourceId: !Ref EvaluationResource
+      HttpMethod: PUT
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${EvaluationApiFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: '200'
+        - StatusCode: '400'
+        - StatusCode: '500'
+
+  # APIデプロイメント
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - EvaluationGetMethod
+      - EvaluationPutMethod
+    Properties:
+      RestApiId: !Ref EvaluationApi
+      StageName: !Ref Environment
+
+  # Lambda関数のAPI Gateway呼び出し許可
+  LambdaApiGatewayPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt EvaluationApiFunction.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${EvaluationApi}/*/*/*'
+
+Outputs:
+  ApiEndpoint:
+    Description: 'API Gatewayのエンドポイント'
+    Value: !Sub 'https://${EvaluationApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiEndpoint'
+
+  DynamoDBTableName:
+    Description: 'DynamoDBテーブル名'
+    Value: !Ref StudentsEvaluationTable
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBTableName'

@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 import * as cdk from 'aws-cdk-lib';
-import { CdkStack } from '../lib/cdk-stack';
+import { EvaluateStudentsStack } from '../lib/cdk-stack';
 
 const app = new cdk.App();
-new CdkStack(app, 'CreatedByQStack', {
+new EvaluateStudentsStack(app, 'EvaluateStudentsStack', {
   /* 環境設定を有効化することで、特定のAWSアカウントとリージョンにデプロイできます */
   env: { account: process.env.CDK_DEFAULT_ACCOUNT, region: process.env.CDK_DEFAULT_REGION },
   
